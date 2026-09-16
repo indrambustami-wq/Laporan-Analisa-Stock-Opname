@@ -38,6 +38,7 @@ BLACK = "000000"
 RED = "FF0000"
 LIGHT_BLUE = "D9EAF7"
 LIGHT_GREEN = "E2F0D9"
+LIGHT_GRAY = "F2F2F2"
 
 THIN_GRAY = Side(
     style="thin",
@@ -84,6 +85,13 @@ REQUIRED_COLUMNS = [
 OPTIONAL_COLUMNS = [
     "HM",
 ]
+
+# Alias nama kolom mentah -> nama kolom standar.
+# Dipakai kalau nama kolom standar (mis. "HM") tidak
+# ditemukan persis, tapi ada kolom lain yang maknanya sama.
+COLUMN_ALIASES = {
+    "HM": ["Cost"],
+}
 
 DETAIL_COLUMNS = [
     "Barcode",
@@ -142,13 +150,21 @@ def find_header_row(raw_df):
     Deteksi otomatis baris header.
     Mencari hingga 50 baris pertama.
     """
-    # Kolom opsional (mis. HM) tetap ikut dihitung skornya
-    # supaya baris header lebih akurat terdeteksi kalau
-    # kolomnya ada, tapi tidak menaikkan syarat minimal.
+    # Kolom opsional (mis. HM) dan alias-nya (mis. Cost)
+    # tetap ikut dihitung skornya supaya baris header lebih
+    # akurat terdeteksi kalau kolomnya ada, tapi tidak
+    # menaikkan syarat minimal.
+    alias_columns = [
+        alias
+        for aliases in COLUMN_ALIASES.values()
+        for alias in aliases
+    ]
+
     expected = {
         canonical(col)
         for col in REQUIRED_COLUMNS
         + OPTIONAL_COLUMNS
+        + alias_columns
     }
 
     max_rows = min(
@@ -191,6 +207,8 @@ def find_header_row(raw_df):
 def map_standard_columns(df):
     """
     Mapping nama kolom mentah ke nama standar.
+    Kalau nama kolom standar tidak ditemukan persis,
+    coba cocokkan dengan alias-nya (lihat COLUMN_ALIASES).
     """
     df = df.copy()
 
@@ -199,10 +217,32 @@ def map_standard_columns(df):
     for standard in REQUIRED_COLUMNS + OPTIONAL_COLUMNS:
         target = canonical(standard)
 
+        match_col = None
+
+        # 1. Cocokkan nama kolom standar persis
         for col in df.columns:
             if canonical(col) == target:
-                rename_map[col] = standard
+                match_col = col
                 break
+
+        # 2. Kalau tidak ketemu, coba alias-nya
+        if match_col is None:
+            for alias in COLUMN_ALIASES.get(
+                standard,
+                [],
+            ):
+                alias_target = canonical(alias)
+
+                for col in df.columns:
+                    if canonical(col) == alias_target:
+                        match_col = col
+                        break
+
+                if match_col is not None:
+                    break
+
+        if match_col is not None:
+            rename_map[match_col] = standard
 
     return df.rename(
         columns=rename_map
@@ -727,6 +767,33 @@ def categorize(df):
         "Kategori",
     ] = "KLOP"
 
+    # ========================================================
+    # REMARK
+    # ========================================================
+    # Default: nama kategori (Klop/Tertukar/Minus/Plus).
+    # Khusus SHOPBAG, ikuti tanda Selisih (Minus/Plus/Klop)
+    # karena SHOPBAG sendiri bisa berisi selisih apa saja.
+
+    def get_remark(row):
+        category = row["Kategori"]
+        selisih = row["Selisih"]
+
+        if category == "SHOPBAG":
+            if selisih < 0:
+                return "Minus"
+
+            if selisih > 0:
+                return "Plus"
+
+            return "Klop"
+
+        return category.capitalize()
+
+    df["Remark"] = df.apply(
+        get_remark,
+        axis=1,
+    )
+
     return df
 
 
@@ -831,13 +898,54 @@ def get_metadata(df):
 def apply_number_format(
     cell,
     money=False,
+    value=None,
 ):
     """
-    Format angka sesuai laporan.
+    Format angka konsisten dengan section
+    NOTE / PERHITUNGAN DEDUCT:
+
+    - money=True  -> pakai prefix "Rp"
+                      (mis. -Rp26.404 / Rp0 / Rp500.000)
+    - money=False -> angka polos
+                      (mis. -12 / 0 / 17)
+
+    Nilai negatif otomatis ditampilkan warna merah.
+
+    Parameter `value` dipakai untuk menentukan warna merah
+    kalau cell.value berupa rumus (string, mis. "=E2-F2")
+    sehingga tandanya tidak bisa dibaca langsung dari
+    cell.value. Kalau tidak diisi, dipakai cell.value.
     """
-    cell.number_format = (
-        '#,##0;(#,##0);"-"'
+
+    if money:
+        cell.number_format = (
+            '"Rp"#,##0;-"Rp"#,##0;"Rp"0'
+        )
+    else:
+        cell.number_format = "#,##0"
+
+    check_value = (
+        cell.value
+        if value is None
+        else value
     )
+
+    if (
+        isinstance(
+            check_value,
+            (int, float),
+        )
+        and check_value < 0
+    ):
+        old_font = cell.font
+
+        cell.font = Font(
+            name=old_font.name,
+            size=old_font.size,
+            bold=old_font.bold,
+            italic=old_font.italic,
+            color=RED,
+        )
 
 
 def apply_border(
@@ -1039,6 +1147,21 @@ def create_final_excel(
             vertical="center"
         )
 
+        label_cell.fill = PatternFill(
+            "solid",
+            fgColor=LIGHT_GRAY,
+        )
+
+        # Kolom C ikut diberi warna sebelum di-merge
+        # dengan kolom B (nilai)
+        ws.cell(
+            row=row,
+            column=3,
+        ).fill = PatternFill(
+            "solid",
+            fgColor=LIGHT_GRAY,
+        )
+
         # Value dipisah ke kolom B:C (merge biar muat)
         ws.merge_cells(
             start_row=row,
@@ -1055,6 +1178,11 @@ def create_final_excel(
 
         value_cell.alignment = Alignment(
             vertical="center"
+        )
+
+        value_cell.fill = PatternFill(
+            "solid",
+            fgColor=LIGHT_GRAY,
         )
 
     # ========================================================
@@ -1127,6 +1255,16 @@ def create_final_excel(
             record["Kategori"]
             == "GRAND TOTAL"
         ):
+            grand_values = [
+                None,
+                record["Qty Fisik"],
+                record["Qty POS"],
+                record["Selisih"],
+                record["Nilai Selisih (Rp)"],
+                record["HM"],
+                record["Total HM"],
+            ]
+
             for offset in range(7):
                 cell = ws.cell(
                     row=excel_row,
@@ -1134,8 +1272,25 @@ def create_final_excel(
                     + offset,
                 )
 
+                raw_value = grand_values[
+                    offset
+                ]
+
+                is_negative = (
+                    isinstance(
+                        raw_value,
+                        (int, float),
+                    )
+                    and raw_value < 0
+                )
+
                 cell.font = Font(
-                    bold=True
+                    bold=True,
+                    color=(
+                        RED
+                        if is_negative
+                        else None
+                    ),
                 )
 
                 apply_border(
@@ -1146,6 +1301,17 @@ def create_final_excel(
     # ========================================================
     # DETAIL TABLE
     # ========================================================
+
+    # Huruf kolom Excel untuk setiap nama kolom di
+    # DETAIL_COLUMNS, dipakai untuk menulis rumus
+    # (Selisih, Total, Total HM).
+    col_letter = {
+        name: get_column_letter(idx)
+        for idx, name in enumerate(
+            DETAIL_COLUMNS,
+            start=1,
+        )
+    }
 
     current_row = 9
 
@@ -1213,15 +1379,6 @@ def create_final_excel(
 
         for _, source in part.iterrows():
 
-            has_remark = bool(
-                str(
-                    source.get(
-                        "Remark",
-                        "",
-                    )
-                ).strip()
-            )
-
             for col_idx, column in enumerate(
                 DETAIL_COLUMNS,
                 start=1,
@@ -1235,10 +1392,44 @@ def create_final_excel(
                 if pd.isna(value):
                     value = ""
 
+                # Kolom hasil kalkulasi ditulis sebagai
+                # rumus Excel (bukan angka statis) supaya
+                # bisa diaudit langsung dari file.
+                formula = None
+
+                if column == "Selisih":
+                    formula = (
+                        f"={col_letter['Qty Fisik']}"
+                        f"{current_row}-"
+                        f"{col_letter['Qty POS']}"
+                        f"{current_row}"
+                    )
+
+                elif column == "Total":
+                    formula = (
+                        f"={col_letter['Selisih']}"
+                        f"{current_row}*"
+                        f"{col_letter['Price']}"
+                        f"{current_row}"
+                    )
+
+                elif column == "Total HM":
+                    formula = (
+                        f"={col_letter['Selisih']}"
+                        f"{current_row}*"
+                        f"{col_letter['HM']}"
+                        f"{current_row}"
+                    )
+
                 cell = ws.cell(
                     row=current_row,
                     column=col_idx,
-                    value=value,
+                    value=(
+                        formula
+                        if formula
+                        is not None
+                        else value
+                    ),
                 )
 
                 cell.border = Border(
@@ -1270,13 +1461,11 @@ def create_final_excel(
                             "HM",
                             "Total HM",
                         ],
-                    )
-
-                # Highlight baris dengan Remark
-                if has_remark:
-                    cell.fill = PatternFill(
-                        "solid",
-                        fgColor=YELLOW,
+                        # Sel Selisih/Total/Total HM
+                        # berisi rumus (string), jadi warna
+                        # merah ditentukan dari nilai asli
+                        # yang sudah dihitung Python.
+                        value=value,
                     )
 
             current_row += 1
@@ -1328,16 +1517,39 @@ def create_final_excel(
             )
 
         # Isi subtotal
+        has_data_rows = (
+            len(part) > 0
+        )
+
+        sum_start = data_start_row
+        sum_end = current_row - 1
+
         for col_idx, source_col in subtotal_map.items():
 
-            value = part[
+            numeric_value = part[
                 source_col
             ].sum()
+
+            letter = col_letter[
+                source_col
+            ]
+
+            if has_data_rows:
+                formula = (
+                    f"=SUM({letter}"
+                    f"{sum_start}:"
+                    f"{letter}"
+                    f"{sum_end})"
+                )
+            else:
+                # Tidak ada baris data,
+                # tulis 0 langsung
+                formula = 0
 
             cell = ws.cell(
                 row=subtotal_row,
                 column=col_idx,
-                value=value,
+                value=formula,
             )
 
             apply_number_format(
@@ -1346,6 +1558,10 @@ def create_final_excel(
                     "Total",
                     "Total HM",
                 ],
+                # Rumus SUM tidak bisa dibaca
+                # tandanya langsung, jadi pakai
+                # nilai asli hasil hitung Python.
+                value=numeric_value,
             )
 
         current_row += 2
@@ -1354,13 +1570,22 @@ def create_final_excel(
     # NOTE / DEDUCT
     # ========================================================
 
+    def apply_rupiah_format(cell):
+        """
+        Format khusus untuk section NOTE/PERHITUNGAN DEDUCT:
+        -Rp26.404 / Rp0 / Rp500.000
+        """
+        cell.number_format = (
+            '"Rp"#,##0;-"Rp"#,##0;"Rp"0'
+        )
+
     note_start = current_row + 1
 
     ws.merge_cells(
         start_row=note_start,
         start_column=1,
         end_row=note_start,
-        end_column=5,
+        end_column=3,
     )
 
     ws.cell(
@@ -1390,8 +1615,6 @@ def create_final_excel(
         "Keterangan",
         "Qty Selisih",
         "Total HM",
-        "Persentase",
-        "Nilai",
     ]
 
     for col_idx, header in enumerate(
@@ -1485,8 +1708,6 @@ def create_final_excel(
             label,
             qty,
             hm,
-            "",
-            "",
         ]
 
         for col_idx, value in enumerate(
@@ -1506,20 +1727,34 @@ def create_final_excel(
                 bottom=THIN_GRAY,
             )
 
-        apply_number_format(
-            ws.cell(
-                row=note_row,
-                column=2,
-            )
+        qty_cell = ws.cell(
+            row=note_row,
+            column=2,
         )
 
-        apply_number_format(
-            ws.cell(
-                row=note_row,
-                column=3,
-            ),
-            money=True,
+        qty_cell.number_format = (
+            "#,##0"
         )
+
+        hm_cell = ws.cell(
+            row=note_row,
+            column=3,
+        )
+
+        apply_rupiah_format(
+            hm_cell
+        )
+
+        # Nilai negatif ditandai merah
+        if qty < 0:
+            qty_cell.font = Font(
+                color=RED
+            )
+
+        if hm < 0:
+            hm_cell.font = Font(
+                color=RED
+            )
 
         note_row += 1
 
@@ -1545,8 +1780,6 @@ def create_final_excel(
         "Total Selisih",
         total_qty,
         total_hm,
-        "",
-        "",
     ]
 
     for col_idx, value in enumerate(
@@ -1570,21 +1803,21 @@ def create_final_excel(
             bottom=DOUBLE_BLACK,
         )
 
-    apply_number_format(
-        ws.cell(
-            row=total_row,
-            column=2,
-        )
-    )
+    ws.cell(
+        row=total_row,
+        column=2,
+    ).number_format = "#,##0"
 
-    apply_number_format(
+    apply_rupiah_format(
         ws.cell(
             row=total_row,
             column=3,
-        ),
-        money=True,
+        )
     )
 
+    note_row += 1
+
+    # Baris kosong (spasi)
     note_row += 1
 
     # --------------------------------------------------------
@@ -1601,58 +1834,47 @@ def create_final_excel(
         + denda_value
     )
 
-    denda_values = [
-        "Total HM + Denda",
-        "",
-        total_hm_denda,
-        penalty_percent,
-        denda_value,
-    ]
+    denda_row = note_row
 
-    for col_idx, value in enumerate(
-        denda_values,
-        start=1,
-    ):
-        cell = ws.cell(
-            row=note_row,
+    ws.cell(
+        row=denda_row,
+        column=1,
+        value="Total HM + Denda",
+    )
+
+    denda_percent_cell = ws.cell(
+        row=denda_row,
+        column=2,
+        value=penalty_percent,
+    )
+
+    denda_percent_cell.number_format = (
+        "0%"
+    )
+
+    denda_value_cell = ws.cell(
+        row=denda_row,
+        column=3,
+        value=total_hm_denda,
+    )
+
+    apply_rupiah_format(
+        denda_value_cell
+    )
+
+    for col_idx in range(1, 4):
+        ws.cell(
+            row=denda_row,
             column=col_idx,
-            value=value,
-        )
-
-        cell.border = Border(
+        ).border = Border(
             left=THIN_GRAY,
             right=THIN_GRAY,
             top=THIN_GRAY,
             bottom=THIN_GRAY,
         )
 
-    ws.cell(
-        row=note_row,
-        column=4,
-    ).number_format = "0%"
-
-    apply_number_format(
-        ws.cell(
-            row=note_row,
-            column=3,
-        ),
-        money=True,
-    )
-
-    apply_number_format(
-        ws.cell(
-            row=note_row,
-            column=5,
-        ),
-        money=True,
-    )
-
     if total_hm_denda < 0:
-        ws.cell(
-            row=note_row,
-            column=3,
-        ).font = Font(
-            bold=True,
+        denda_value_cell.font = Font(
             color=RED,
         )
 
@@ -1662,75 +1884,27 @@ def create_final_excel(
     # KOMPENSASI
     # --------------------------------------------------------
 
-    compensation_values = [
-        "Kompensasi",
-        "",
-        compensation,
-        "",
-        "",
-    ]
-
-    for col_idx, value in enumerate(
-        compensation_values,
-        start=1,
-    ):
-        cell = ws.cell(
-            row=note_row,
-            column=col_idx,
-            value=value,
-        )
-
-        cell.border = Border(
-            left=THIN_GRAY,
-            right=THIN_GRAY,
-            top=THIN_GRAY,
-            bottom=THIN_GRAY,
-        )
-
-    apply_number_format(
-        ws.cell(
-            row=note_row,
-            column=3,
-        ),
-        money=True,
-    )
-
-    note_row += 1
-
-    # --------------------------------------------------------
-    # CATATAN KOMPENSASI
-    # --------------------------------------------------------
+    kompensasi_row = note_row
 
     ws.cell(
-        row=note_row,
+        row=kompensasi_row,
         column=1,
-        value="Catatan Kompensasi",
+        value="Kompensasi",
     )
 
-    ws.merge_cells(
-        start_row=note_row,
-        start_column=2,
-        end_row=note_row,
-        end_column=5,
+    kompensasi_cell = ws.cell(
+        row=kompensasi_row,
+        column=3,
+        value=compensation,
     )
 
-    note_cell = ws.cell(
-        row=note_row,
-        column=2,
-        value=compensation_note,
+    apply_rupiah_format(
+        kompensasi_cell
     )
 
-    note_cell.alignment = Alignment(
-        vertical="center",
-        wrap_text=True,
-    )
-
-    for col_idx in range(
-        1,
-        6,
-    ):
+    for col_idx in range(1, 4):
         ws.cell(
-            row=note_row,
+            row=kompensasi_row,
             column=col_idx,
         ).border = Border(
             left=THIN_GRAY,
@@ -1739,6 +1913,9 @@ def create_final_excel(
             bottom=THIN_GRAY,
         )
 
+    note_row += 1
+
+    # Baris kosong (spasi)
     note_row += 1
 
     # --------------------------------------------------------
@@ -1751,25 +1928,21 @@ def create_final_excel(
         - compensation,
     )
 
-    deduct_values = [
-        "Total Deduct",
-        "",
-        total_deduct,
-        "",
-        "",
-    ]
+    deduct_row = note_row
 
-    for col_idx, value in enumerate(
-        deduct_values,
-        start=1,
-    ):
-        cell = ws.cell(
-            row=note_row,
+    ws.cell(
+        row=deduct_row,
+        column=1,
+        value="Total Deduct",
+    ).font = Font(
+        bold=True
+    )
+
+    for col_idx in range(1, 4):
+        ws.cell(
+            row=deduct_row,
             column=col_idx,
-            value=value,
-        )
-
-        cell.border = Border(
+        ).border = Border(
             left=THIN_GRAY,
             right=THIN_GRAY,
             top=DOUBLE_BLACK,
@@ -1778,8 +1951,9 @@ def create_final_excel(
 
     # Deduct wajib kuning
     deduct_cell = ws.cell(
-        row=note_row,
+        row=deduct_row,
         column=3,
+        value=total_deduct,
     )
 
     deduct_cell.fill = PatternFill(
@@ -1792,52 +1966,187 @@ def create_final_excel(
         color=BLACK,
     )
 
-    apply_number_format(
-        deduct_cell,
-        money=True,
+    apply_rupiah_format(
+        deduct_cell
     )
+
+    note_row += 1
+
+    # --------------------------------------------------------
+    # CATATAN KOMPENSASI (teks miring di bawah tabel)
+    # --------------------------------------------------------
+
+    if compensation_note:
+
+        catatan_row = note_row + 1
+
+        ws.merge_cells(
+            start_row=catatan_row,
+            start_column=1,
+            end_row=catatan_row,
+            end_column=3,
+        )
+
+        catatan_cell = ws.cell(
+            row=catatan_row,
+            column=1,
+            value=(
+                f"Catatan Kompensasi: "
+                f"{compensation_note}"
+            ),
+        )
+
+        catatan_cell.font = Font(
+            italic=True,
+        )
+
+        catatan_cell.alignment = Alignment(
+            vertical="center",
+            wrap_text=True,
+        )
+
+        note_row = catatan_row
 
     # ========================================================
     # GLOBAL EXCEL FORMATTING
     # ========================================================
 
-    ws.freeze_panes = "A10"
+    ws.freeze_panes = "A11"
 
     # --------------------------------------------------------
-    # Column widths
+    # Auto-fit lebar kolom (dihitung dari isi tiap kolom)
     # --------------------------------------------------------
 
-    widths = {
-        "A": 18,
-        "B": 30,
-        "C": 24,
-        "D": 15,
-        "E": 14,
-        "F": 14,
-        "G": 14,
-        "H": 18,
-        "I": 14,
-        "J": 16,
-        "K": 30,
+    def estimate_formatted_length(
+        raw_value,
+        money=False,
+    ):
+        """
+        Perkiraan panjang teks angka setelah diformat
+        (dipakai untuk kolom yang isinya rumus, karena
+        openpyxl tidak bisa membaca hasil rumus).
+        """
+        try:
+            number = float(raw_value)
+        except (TypeError, ValueError):
+            return len(
+                str(raw_value)
+            )
+
+        text = f"{abs(number):,.0f}"
+
+        if money:
+            text = "Rp" + text
+
+        if number < 0:
+            text = "-" + text
+
+        return len(text)
+
+    MIN_COLUMN_WIDTH = 10
+    MAX_COLUMN_WIDTH = 40
+    COLUMN_PADDING = 2
+
+    # Sel yang jadi "anchor" dari merge lebih dari 1 kolom
+    # dilewati dari perhitungan (teksnya tidak perlu muat
+    # dalam satu kolom saja, mis. judul & catatan panjang).
+    wide_merge_anchors = set()
+
+    for merged_range in ws.merged_cells.ranges:
+        if (
+            merged_range.max_col
+            > merged_range.min_col
+        ):
+            wide_merge_anchors.add(
+                (
+                    merged_range.min_row,
+                    merged_range.min_col,
+                )
+            )
+
+    max_lengths = {}
+
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is None:
+                continue
+
+            if (
+                cell.row,
+                cell.column,
+            ) in wide_merge_anchors:
+                continue
+
+            text = str(cell.value)
+
+            # Sel berisi rumus: panjang teks rumusnya
+            # tidak merepresentasikan tampilan akhir,
+            # jadi dilewati (diestimasi terpisah di bawah).
+            if text.startswith("="):
+                continue
+
+            col = cell.column_letter
+
+            max_lengths[col] = max(
+                max_lengths.get(
+                    col, 0
+                ),
+                len(text),
+            )
+
+    # Kolom hasil rumus di tabel detail (Selisih, Total,
+    # Total HM) diestimasi dari nilai asli di dataframe.
+    formula_columns = {
+        col_letter["Selisih"]: (
+            df["Selisih"],
+            False,
+        ),
+        col_letter["Total"]: (
+            df["Total"],
+            True,
+        ),
+        col_letter["Total HM"]: (
+            df["Total HM"],
+            True,
+        ),
     }
 
-    for column, width in widths.items():
+    for col, (
+        series,
+        money,
+    ) in formula_columns.items():
+
+        if len(series) == 0:
+            continue
+
+        estimated = max(
+            estimate_formatted_length(
+                v,
+                money=money,
+            )
+            for v in series
+        )
+
+        max_lengths[col] = max(
+            max_lengths.get(
+                col, 0
+            ),
+            estimated,
+        )
+
+    for col, length in max_lengths.items():
+        width = min(
+            max(
+                length
+                + COLUMN_PADDING,
+                MIN_COLUMN_WIDTH,
+            ),
+            MAX_COLUMN_WIDTH,
+        )
+
         ws.column_dimensions[
-            column
+            col
         ].width = width
-
-    # Summary D:J
-    ws.column_dimensions[
-        "D"
-    ].width = 16
-
-    ws.column_dimensions[
-        "H"
-    ].width = 19
-
-    ws.column_dimensions[
-        "J"
-    ].width = 16
 
     # --------------------------------------------------------
     # Row height
